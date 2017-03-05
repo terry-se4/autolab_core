@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 Lean rigid transformation class
 Author: Jeff
@@ -16,8 +17,50 @@ try:
 except:
     logging.warning('Failed to import geometry msgs in rigid_transformations.py.')
 
+ROS_ENABLED = False
+try: 
+    import rospy
+    import tf
+    import tf2_ros
+    import tf2_msgs
+    import multiprocessing
+    import Queue
+    ROS_ENABLED = True
+except ImportError as e:
+    logging.warning('Failed to import something for ROS functionality: {}'.format(e))
+
 TF_EXTENSION = '.tf'
 STF_EXTENSION = '.stf'
+
+def _TF_publish(rigid_transform_initial, rigid_transform_queue, mode='transform'):
+    """Publishes transform to TF.
+    DO NOT run this directly. It WILL hang. This is because rospy.init_node can only be
+    called once per python process and breaks in terrible ways when used in modules.
+    
+    Instead, use the RigidTransform class methods begin_ros_publishing, update_ros_publishing
+    and stop_ros_publishing.
+    
+    Also see those methods for documentation.
+    """
+    rospy.init_node('rigid_transform_publisher', anonymous=True, disable_signals=True)
+    if mode == 'transform':
+        broadcaster = tf2_ros.TransformBroadcaster()
+        publish_transform = broadcaster.sendTransform
+    elif mode == 'frame':
+        publisher = rospy.Publisher("/tf", tf2_msgs.msg.TFMessage, queue_size=1)
+        publish_transform = lambda msg: publisher.publish(tf2_msgs.msg.TFMessage([msg]))
+    
+    rigid_transform = rigid_transform_initial
+    while not rospy.is_shutdown():
+        if not rigid_transform_queue.empty():
+            try:
+                rigid_transform = rigid_transform_queue.get_nowait()
+            except Queue.Empty:
+                pass
+        publish_transform(rigid_transform.as_stamped_transform(rospy.Time.now()))
+        
+        # Run loop at ~10Hz
+        rospy.sleep(0.1)
 
 class RigidTransform(object):
     """A Rigid Transformation from one frame to another.
@@ -62,6 +105,10 @@ class RigidTransform(object):
         self.translation = translation
         self._from_frame = from_frame
         self._to_frame = to_frame
+        
+        if ROS_ENABLED:
+            self.publisher_process = None
+            self.publisher_queue = None
 
     def copy(self):
         """Returns a copy of the RigidTransform.
@@ -474,6 +521,83 @@ class RigidTransform(object):
             The RigidTransform with new frames.
         """
         return RigidTransform(self.rotation, self.translation, from_frame, to_frame)
+    
+    def as_stamped_transform(self, time):
+        """Returns the transform as a stamped geometry_msgs transform.
+        Requires geometry_msgs
+        
+        Parameters
+        ----------
+        time : :obj:`rospy.Time`
+            Timestamp to attach to the stamped transform
+        
+        Returns
+        -------
+        :obj:`geometry_msgs.msg.TransformStamped`
+            The transform as a stamped geometry_msgs transform
+        """ 
+        t = geometry_msgs.msg.TransformStamped()
+
+        t.header.stamp = time
+        t.header.frame_id = self.from_frame
+        t.child_frame_id = self.to_frame
+        
+        trans = self.translation
+        rot = self.quaternion
+        t.transform.translation.x = trans[0]
+        t.transform.translation.y = trans[1]
+        t.transform.translation.z = trans[2]
+        t.transform.rotation.w = rot[0]
+        t.transform.rotation.x = rot[1]
+        t.transform.rotation.y = rot[2]
+        t.transform.rotation.z = rot[3]
+        
+        return t
+        
+    def begin_ROS_publishing(self, mode='transform'):
+        """Begins publishing transform to ROS TF
+        Requires rospy, tf, tf2_ros, and multiprocessing to have imported successfully
+        
+        Fails if publishing is already running 
+        
+        Parameters
+        ----------
+        mode : :obj:`str`
+            The mode of publishing. In {'transform', 'frame'}
+            Transform will be published through broadcasting as a transform
+            or publishing as a frame depending on selection 
+            
+        Raises
+        ------
+        RuntimeError
+            If publishing is already running when function is called
+        """
+        if self.publisher_process != None:
+            raise RuntimeError("Already publishing to ROS! Terminate before restarting publisher")
+        self.publisher_queue = multiprocessing.Manager().Queue()
+        self.publisher_process = multiprocessing.Process(target=_TF_publish, args=(self.copy(),self.publisher_queue,mode))
+        self.publisher_process.daemon = True
+        self.publisher_process.start()
+    def update_ROS_publishing(self):
+        """Updates the transform that is being published to ROS TF
+        Note that there may be some latency between when this is called and when the transform
+        being broadcast to TF changes
+        """
+        while not self.publisher_queue.empty():
+            try:
+                self.publisher_queue.get_nowait()
+            except Queue.Empty:
+                pass
+        self.publisher_queue.put(self.copy())
+    def stop_ROS_publishing(self):
+        """Stops ROS publisher.
+        """
+        try:
+            self.publisher_process.terminate()
+        except:
+            pass
+        self.publisher_process = None
+        self.publisher_queue = None
 
     def __str__(self):
         out = 'Tra: {0}\n Rot: {1}\n Qtn: {2}\n from {3} to {4}'.format(self.translation, self.rotation,
@@ -484,6 +608,7 @@ class RigidTransform(object):
         out = 'RigidTransform(rotation={0}, translation={1}, from_frame={2}, to_frame={3})'.format(self.rotation,
                 self.translation, self.from_frame, self.to_frame)
         return out
+    
 
     @staticmethod
     def rotation_from_quaternion(q_wxyz):
